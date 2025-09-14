@@ -15,10 +15,12 @@
 2. Зарегистироваться на [сайте](https://пополнистим.рф/)
 3. Настройка .env
 ```
-FUNPAY_AUTH_TOKEN=ваш_золотой_ключ_FunPay  
-STEAM_API_USER=ваш_ник_на_сайте 
-STEAM_API_PASS-=ваш_пароль_на_сайте  
-FRAGMENT_MNEMONICS=минимальный баланс при котором лоты будут деактивироваться
+FUNPAY_AUTH_TOKEN=FUNPAY_AUTH_TOKEN
+STEAM_API_USER=STEAM_API_USER
+STEAM_API_PASS=STEAM_API_PASS
+MIN_BALANCE = 1
+AUTO_REFUND = true/false
+AUTO_DEACTIVATE = true/false
 ```
 
 Более подробная [Инструкция](https://teletype.in/@tinechelovec/Funpay-AutoSteam)
