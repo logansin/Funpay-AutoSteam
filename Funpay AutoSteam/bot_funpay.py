@@ -11,14 +11,12 @@ from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 
-# ---------- ENV ----------
 load_dotenv()
 
 FUNPAY_AUTH_TOKEN = os.getenv("FUNPAY_AUTH_TOKEN")
 STEAM_API_USER = os.getenv("STEAM_API_USER")
 STEAM_API_PASS = os.getenv("STEAM_API_PASS")
 MIN_BALANCE = float(os.getenv("MIN_BALANCE", "5"))
-
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -31,7 +29,17 @@ AUTO_DEACTIVATE = _env_bool("AUTO_DEACTIVATE", True)
 
 CATEGORY_ID = 1086
 
-# ---------- COLORFUL LOGGING ----------
+CREATOR_NAME = os.getenv("CREATOR_NAME", "@tinechelovec")
+CREATOR_URL = os.getenv("CREATOR_URL", "https://t.me/tinechelovec")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/by_thc")
+GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/tinechelovec/Funpay-AutoSteam")
+BANNER_NOTE = os.getenv(
+    "BANNER_NOTE",
+    "Бот бесплатный и с открытым исходным кодом на GitHub. "
+    "Создатель бота его НЕ продаёт. Если вы где-то видите платную версию — "
+    "это решение перепродавца, к автору отношения не имеет."
+)
+
 try:
     from colorama import init as colorama_init, Fore, Style
     colorama_init(autoreset=True)
@@ -52,7 +60,6 @@ class ColorFormatter(logging.Formatter):
         logging.ERROR: Fore.RED,
         logging.CRITICAL: Fore.MAGENTA + Style.BRIGHT,
     }
-
     def format(self, record):
         color = self.LEVEL_COLORS.get(record.levelno, "")
         message = super().format(record)
@@ -62,25 +69,116 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s:%(lineno)d | %(message)s"
 )
+
+file_handler = logging.FileHandler("log.txt", encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s:%(lineno)d | %(message)s"))
+logging.getLogger().addHandler(file_handler)
+
 for h in logging.getLogger().handlers:
+    if isinstance(h, logging.FileHandler):
+        continue
     h.setFormatter(ColorFormatter(h.formatter._fmt if hasattr(h, "formatter") else "%(message)s"))
 
 logger = logging.getLogger("SteamBot")
 
-# ---------- CONSTANTS & STATE ----------
-MIN_AMOUNTS = {
-    "RUB": 15,
-    "KZT": 80,
-    "UAH": 7,
-    "USD": 0.15
-}
-
+MIN_AMOUNTS = {"RUB": 15, "KZT": 80, "UAH": 7, "USD": 0.15}
 STEAM_BASE = "https://xn--h1aahgceagbyl.xn--p1ai/api"
 REQUEST_TIMEOUT = 20
 
 USER_STATES = {}
+SESSION_TTL = 60 * 60
 
-# ==================== AUTH / TOKEN ====================
+MY_ID = None
+
+LOG_COLOR_BOT  = Fore.GREEN + Style.BRIGHT
+LOG_COLOR_USER = Fore.WHITE + Style.BRIGHT
+LOG_COLOR_SYS  = Fore.CYAN + Style.NORMAL
+
+def _short(s: str | None, n: int = 12) -> str:
+    if not s:
+        return "-"
+    s = str(s)
+    return s if len(s) <= n else s[-n:]
+
+def _who_and_color(author_id) -> tuple[str, str]:
+    if author_id in (None, 0):
+        return "SYS", LOG_COLOR_SYS
+    try:
+        if MY_ID is not None and str(author_id) == str(MY_ID):
+            return "BOT", LOG_COLOR_BOT
+    except Exception:
+        pass
+    return "USER", LOG_COLOR_USER
+
+def _resolve_order_id(message, state) -> str | None:
+    return getattr(message, "order_id", None) or (state.get("order_id") if isinstance(state, dict) else None)
+
+def log_chat(message, state, text_snippet: str = ""):
+    author_id = getattr(message, "author_id", None)
+    chat_id = (
+        getattr(message, "chat_id", None)
+        or getattr(message, "dialog_id", None)
+        or getattr(message, "conversation_id", None)
+    )
+    who, color = _who_and_color(author_id)
+    order_id = _resolve_order_id(message, state)
+    buyer_id = state.get("buyer_id") if isinstance(state, dict) else None
+
+    prefix = f"{color}[{who}]{Style.RESET_ALL}"
+    tag_order = f" #{order_id}" if order_id else ""
+    tag_user  = f" user={buyer_id}" if buyer_id else ""
+    tag_chat  = f" chat={_short(chat_id)}"
+    logger.info(f"{prefix}{tag_order}{tag_user}{tag_chat} → {text_snippet}")
+
+def _norm_id(v):
+    if v is None:
+        return None
+    try:
+        return str(int(v))
+    except Exception:
+        return str(v).strip()
+
+def _state_keys(chat_id=None, buyer_id=None, order_id=None):
+    keys = []
+    c = _norm_id(chat_id)
+    b = _norm_id(buyer_id)
+    o = _norm_id(order_id)
+    if c: keys.append(f"chat:{c}")
+    if b: keys.append(f"user:{b}")
+    if b and o: keys.append(f"user:{b}:order:{o}")
+    return keys
+
+def _put_state(state: dict):
+    keys = _state_keys(state.get("chat_id"), state.get("buyer_id"), state.get("order_id"))
+    state["_keys"] = keys
+    for k in keys:
+        USER_STATES[k] = state
+    logger.info(Fore.CYAN + f"[STATE] index -> {', '.join(keys)}")
+
+def _pop_state(state_or_key):
+    if isinstance(state_or_key, dict):
+        keys = state_or_key.get("_keys", [])
+    else:
+        keys = [state_or_key]
+    for k in list(keys):
+        USER_STATES.pop(k, None)
+
+def _find_state_for_message(msg):
+    chat_id = getattr(msg, "chat_id", None) or getattr(msg, "dialog_id", None) or getattr(msg, "conversation_id", None)
+    author_id = getattr(msg, "author_id", None)
+    order_id = getattr(msg, "order_id", None)
+    for k in _state_keys(chat_id, author_id, order_id):
+        s = USER_STATES.get(k)
+        if s:
+            return s
+    b = _norm_id(author_id)
+    if b:
+        candidates = [s for k, s in USER_STATES.items() if k.startswith(f"user:{b}")]
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
 STEAM_TOKEN: str | None = None
 _STEAM_TOKEN_LOCK = threading.Lock()
 
@@ -123,15 +221,11 @@ def _request_with_refresh(method: str, path: str, retry: bool = True, **kwargs) 
     _ensure_token()
     headers = kwargs.pop("headers", {}) or {}
     url = f"{STEAM_BASE}{path}"
-
-    resp = requests.request(method.upper(), url, headers={**headers, **steam_headers()},
-                            timeout=REQUEST_TIMEOUT, **kwargs)
-
+    resp = requests.request(method.upper(), url, headers={**headers, **steam_headers()}, timeout=REQUEST_TIMEOUT, **kwargs)
     if resp.status_code in (401, 403) and retry:
         logger.warning(Fore.YELLOW + f"[AUTH] {resp.status_code} на {path}. Обновляю токен и повторяю запрос.")
         _refresh_token()
-        resp = requests.request(method.upper(), url, headers={**headers, **steam_headers()},
-                                timeout=REQUEST_TIMEOUT, **kwargs)
+        resp = requests.request(method.upper(), url, headers={**headers, **steam_headers()}, timeout=REQUEST_TIMEOUT, **kwargs)
     return resp
 
 def _token_refresher_loop(interval_sec: int = 50 * 60):
@@ -146,8 +240,19 @@ def _token_refresher_loop(interval_sec: int = 50 * 60):
 def start_token_refresher(interval_sec: int = 50 * 60):
     t = threading.Thread(target=_token_refresher_loop, args=(interval_sec,), daemon=True)
     t.start()
+    def _t():
+        _m = "".join([
+            "Сп", "асибо, ", "что пользуетесь этим ботом, он полностью бесплатный. ",
+            "Автор не продаёт его."
+        ])
+        while True:
+            try:
+                time.sleep(15 * 60)
+                logger.info(Fore.MAGENTA + _m + (f" Исходники: {GITHUB_URL}" if GITHUB_URL else ""))
+            except Exception:
+                pass
+    threading.Thread(target=_t, daemon=True).start()
 
-# ==================== STEAM API ====================
 def _friendly_http_error(resp: requests.Response, default_msg: str = "Сервис временно недоступен."):
     try:
         data = resp.json()
@@ -182,10 +287,7 @@ def convert_to_usd(currency: str, amount: float) -> float | None:
     try:
         if currency.upper() == "USD":
             return float(amount)
-        r = _request_with_refresh(
-            "POST", "/rates",
-            json={"primary_currency": currency.upper(), "amount": amount}
-        )
+        r = _request_with_refresh("POST", "/rates", json={"primary_currency": currency.upper(), "amount": amount})
         if r.status_code != 200:
             logger.warning(Fore.YELLOW + f"[RATES] Нехороший ответ: {r.status_code} {r.text[:200]}")
             return None
@@ -196,28 +298,17 @@ def convert_to_usd(currency: str, amount: float) -> float | None:
 
 def create_order(login: str, usd_amount: float):
     custom_id = str(uuid.uuid4())
-    payload = {
-        "service_id": 1,
-        "quantity": round(float(usd_amount), 2),
-        "custom_id": custom_id,
-        "data": login
-    }
+    payload = {"service_id": 1, "quantity": round(float(usd_amount), 2), "custom_id": custom_id, "data": login}
     logger.debug(Fore.BLUE + f"[DEBUG] payload create_order: {payload}")
     r = _request_with_refresh("POST", "/create_order", json=payload)
-    logger.info(
-        (Fore.GREEN if r.status_code == 200 else Fore.RED)
-        + f"🧾 Создание заказа {custom_id}: HTTP {r.status_code}"
-    )
+    logger.info((Fore.GREEN if r.status_code == 200 else Fore.RED) + f"🧾 Создание заказа {custom_id}: HTTP {r.status_code}")
     return r, custom_id
 
 def pay_order(custom_id: str):
     payload = {"custom_id": str(custom_id)}
     logger.debug(Fore.BLUE + f"[DEBUG] payload pay_order: {payload}")
     r = _request_with_refresh("POST", "/pay_order", json=payload)
-    logger.info(
-        (Fore.GREEN if r.status_code == 200 else Fore.RED)
-        + f"💳 Оплата заказа {custom_id}: HTTP {r.status_code}"
-    )
+    logger.info((Fore.GREEN if r.status_code == 200 else Fore.RED) + f"💳 Оплата заказа {custom_id}: HTTP {r.status_code}")
     return r
 
 def check_balance() -> float:
@@ -238,85 +329,61 @@ def deactivate_category(account: Account, category_id: int):
     except Exception as e:
         logger.error(Fore.RED + f"[LOTS] Не удалось получить список лотов категории {category_id}: {e}")
         return
-
     if not my_lots:
         logger.info(Fore.YELLOW + f"[LOTS] В категории {category_id} нет лотов для деактивации.")
         return
 
-    deactivated = 0
-    skipped = 0
-    failed = 0
-
+    deactivated = skipped = failed = 0
     for lot in my_lots:
         lot_id = getattr(lot, "id", None)
         if lot_id is None:
             logger.warning(Fore.YELLOW + "[LOTS] Пропускаю элемент без lot.id")
             skipped += 1
             continue
-
         try:
             fields = account.get_lot_fields(lot_id)
         except Exception as e:
             logger.error(Fore.RED + f"[LOTS] Не удалось получить поля лота {lot_id}: {e}")
             failed += 1
             continue
-
         if fields is None:
             logger.warning(Fore.YELLOW + f"[LOTS] get_lot_fields вернул None для {lot_id} — пропускаю")
             skipped += 1
             continue
-
         try:
             if isinstance(fields, dict):
                 is_active = fields.get("active", fields.get("is_active", True))
                 if not is_active:
-                    logger.debug(f"[LOTS] Лот {lot_id} уже деактивирован (dict).")
                     skipped += 1
                     continue
                 fields["active"] = False
                 account.save_lot(fields)
             else:
                 active_val = (
-                    getattr(fields, "active", None)
-                    if hasattr(fields, "active")
-                    else getattr(fields, "is_active", None)
-                    if hasattr(fields, "is_active")
-                    else getattr(fields, "enabled", None)
-                    if hasattr(fields, "enabled")
+                    getattr(fields, "active", None) if hasattr(fields, "active")
+                    else getattr(fields, "is_active", None) if hasattr(fields, "is_active")
+                    else getattr(fields, "enabled", None) if hasattr(fields, "enabled")
                     else None
                 )
-
                 if active_val is False:
-                    logger.debug(f"[LOTS] Лот {lot_id} уже деактивирован (obj).")
                     skipped += 1
                     continue
-
-                if hasattr(fields, "active"):
-                    fields.active = False
-                elif hasattr(fields, "is_active"):
-                    fields.is_active = False
-                elif hasattr(fields, "enabled"):
-                    fields.enabled = False
+                if hasattr(fields, "active"): fields.active = False
+                elif hasattr(fields, "is_active"): fields.is_active = False
+                elif hasattr(fields, "enabled"): fields.enabled = False
                 else:
-                    logger.warning(Fore.YELLOW + f"[LOTS] Не найден флаг активности у лота {lot_id} — пропускаю")
                     skipped += 1
                     continue
-
                 account.save_lot(fields)
-
             deactivated += 1
             logger.info(Fore.YELLOW + f"[LOTS] Деактивирован лот {lot_id}")
             time.sleep(0.3)
-
         except Exception as e:
             logger.error(Fore.RED + f"[LOTS] Ошибка деактивации лота {lot_id}: {e}")
             failed += 1
             continue
 
-    logger.warning(
-        Fore.YELLOW
-        + f"[LOTS] Итог: деактивировано={deactivated}, пропущено={skipped}, с ошибкой={failed} (категория {category_id})"
-    )
+    logger.warning(Fore.YELLOW + f"[LOTS] Итог: деактивировано={deactivated}, пропущено={skipped}, с ошибкой={failed} (категория {category_id})")
 
 def activate_category(account: Account, category_id: int):
     try:
@@ -324,27 +391,21 @@ def activate_category(account: Account, category_id: int):
     except Exception as e:
         logger.error(Fore.RED + f"[LOTS] Не удалось получить список лотов категории {category_id}: {e}")
         return
-
     if not my_lots:
         logger.info(Fore.YELLOW + f"[LOTS] В категории {category_id} нет лотов для активации.")
         return
 
-    activated = 0
-    skipped = 0
-    failed = 0
-
+    activated = skipped = failed = 0
     for lot in my_lots:
         lot_id = getattr(lot, "id", None)
         if lot_id is None:
             skipped += 1
             continue
-
         try:
             fields = account.get_lot_fields(lot_id)
             if fields is None:
                 skipped += 1
                 continue
-
             if isinstance(fields, dict):
                 is_active = fields.get("active", fields.get("is_active", False))
                 if is_active:
@@ -354,45 +415,31 @@ def activate_category(account: Account, category_id: int):
                 account.save_lot(fields)
             else:
                 active_val = (
-                    getattr(fields, "active", None)
-                    if hasattr(fields, "active")
-                    else getattr(fields, "is_active", None)
-                    if hasattr(fields, "is_active")
-                    else getattr(fields, "enabled", None)
-                    if hasattr(fields, "enabled")
+                    getattr(fields, "active", None) if hasattr(fields, "active")
+                    else getattr(fields, "is_active", None) if hasattr(fields, "is_active")
+                    else getattr(fields, "enabled", None) if hasattr(fields, "enabled")
                     else None
                 )
                 if active_val is True:
                     skipped += 1
                     continue
-
-                if hasattr(fields, "active"):
-                    fields.active = True
-                elif hasattr(fields, "is_active"):
-                    fields.is_active = True
-                elif hasattr(fields, "enabled"):
-                    fields.enabled = True
+                if hasattr(fields, "active"): fields.active = True
+                elif hasattr(fields, "is_active"): fields.is_active = True
+                elif hasattr(fields, "enabled"): fields.enabled = True
                 else:
                     skipped += 1
                     continue
-
                 account.save_lot(fields)
-
             activated += 1
             logger.info(Fore.GREEN + f"[LOTS] Активирован лот {lot_id}")
             time.sleep(0.3)
-
         except Exception as e:
             logger.error(Fore.RED + f"[LOTS] Ошибка активации лота {lot_id}: {e}")
             failed += 1
             continue
 
-    logger.warning(
-        Fore.CYAN
-        + f"[LOTS] Итог активации: активировано={activated}, пропущено={skipped}, с ошибкой={failed} (категория {category_id})"
-    )
+    logger.warning(Fore.CYAN + f"[LOTS] Итог активации: активировано={activated}, пропущено={skipped}, с ошибкой={failed} (категория {category_id})")
 
-# ==================== HELPERS ====================
 def _first_number_from_string(s: str) -> float | None:
     m = re.search(r"(\d+(?:[.,]\d+)?)", s)
     if m:
@@ -444,7 +491,7 @@ def get_order_amount(order) -> tuple[float, str] | None:
                 logger.info(Fore.CYAN + f"[get_order_amount] Найдено по приоритетному шаблону: {val} (pattern: {pat})")
                 return val, f"pattern:{pat}"
             except Exception:
-                continue
+                pass
 
     first_num = _first_number_from_string(full_text)
     if first_num is not None:
@@ -480,7 +527,6 @@ def _nice_refund(account: Account, chat_id, order_id, user_text: str):
         except Exception as e:
             logger.error(Fore.RED + f"[REFUND] Ошибка возврата по заказу {order_id}: {e}")
 
-# ==================== HANDLERS ====================
 def handle_new_order(account: Account, order):
     try:
         _refresh_token()
@@ -504,7 +550,7 @@ def handle_new_order(account: Account, order):
         if "steam_wallet:" not in desc_text:
             _nice_refund(
                 account, chat_id, getattr(order, "id", None),
-                "⚠️ Ошибка в заказе: не указана валюта (ожидалось `steam_wallet: rub|uah|kzt|usd`)."
+                "⚠️ Ошибка в заказе: не указана валюта (ожидалось steam_wallet: rub|uah|kzt|usd)."
             )
             return
 
@@ -547,24 +593,30 @@ def handle_new_order(account: Account, order):
             )
             return
 
-        USER_STATES[buyer_id] = {
+        state = {
             "step": "waiting_login",
+            "created_at": time.time(),
+            "buyer_id": buyer_id,
             "order_id": getattr(order, "id", None),
             "chat_id": chat_id,
             "amount": amount,
             "currency": currency,
-            "usd_amount": usd_amount
+            "usd_amount": usd_amount,
+            "paid": False
         }
+        _put_state(state)
+
         account.send_message(
             chat_id,
             "👋 Спасибо за заказ!\n\n"
             f"Сумма пополнения: {amount} {currency} (≈ {usd_amount:.2f} USD).\n"
-            "Пожалуйста, укажите ваш *Steam-логин* (без почты и телефона)."
+            "Пожалуйста, укажите ваш Steam-логин (без почты и телефона)."
         )
         logger.info(Fore.BLUE + f"⏳ Ожидаем логин от покупателя {buyer_id}...")
 
     except Exception:
         logger.exception(Fore.RED + "Ошибка обработки заказа (общая)")
+    logger.info(Fore.CYAN + f"[ORDER->STATE] chat_id={chat_id} buyer_id={buyer_id} order_id={getattr(order,'id',None)}")
 
 def handle_new_message(account: Account, message):
     if not message:
@@ -572,30 +624,60 @@ def handle_new_message(account: Account, message):
         return
 
     user_id = getattr(message, "author_id", None)
-    chat_id = getattr(message, "chat_id", None)
+    msg_chat_id = (
+        getattr(message, "chat_id", None)
+        or getattr(message, "dialog_id", None)
+        or getattr(message, "conversation_id", None)
+    )
+
     raw_text = (
         getattr(message, "text", None)
         or getattr(message, "body", None)
         or getattr(message, "content", None)
         or ""
     )
-    if not isinstance(raw_text, str) or not raw_text.strip():
-        logger.debug(f"[MSG] Нет текстового содержимого (type={type(raw_text).__name__}) — пропускаю")
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
+    snippet = (text or (str(raw_text) if raw_text is not None else ""))[:200]
+
+    if not isinstance(raw_text, str) or not text:
+        logger.debug("[MSG] Нет текстового содержимого — пропускаю")
         return
-    text = raw_text.strip()
 
-    if not user_id or user_id not in USER_STATES:
+    state = _find_state_for_message(message) if "_find_state_for_message" in globals() else None
+    if not state:
+        if msg_chat_id and msg_chat_id in USER_STATES:
+            state = USER_STATES[msg_chat_id]
+        else:
+            log_chat(message, {}, snippet)
+            logger.debug(Fore.BLUE + f"[MSG] Нет активной сессии для chat_id={msg_chat_id}, author_id={user_id}")
+            return
+
+    log_chat(message, state, snippet)
+
+    chat_id = msg_chat_id or state.get("chat_id")
+
+    if user_id and state.get("buyer_id") and user_id != state["buyer_id"]:
         return
 
-    state = USER_STATES[user_id]
+    if time.time() - state.get("created_at", time.time()) > SESSION_TTL:
+        logger.info(Fore.YELLOW + f"[MSG] Сессия в чате {chat_id} протухла — очищаю.")
+        if "_pop_state" in globals():
+            _pop_state(state)
+        else:
+            USER_STATES.pop(chat_id, None)
+        return
 
-    if state["step"] == "waiting_login":
+    if state.get("step") in ("paying", "finished"):
+        logger.info(Fore.BLUE + f"[MSG] Игнор дубля (step={state['step']}) в чате {chat_id}")
+        return
+
+    if state.get("step") == "waiting_login":
         login = text
         if not check_login(login):
             account.send_message(
                 chat_id,
-                f"⚠️ Логин *{login}* не найден. Проверьте правильность написания и отправьте ещё раз.\n\n"
-                "Пример: `gabelogannewell`"
+                f"⚠️ Логин {login} не найден. Проверьте правильность написания и отправьте ещё раз.\n\n"
+                "Пример: gabelogannewell"
             )
             logger.info(Fore.YELLOW + f"🚫 Логин не найден: {login}")
             return
@@ -605,16 +687,22 @@ def handle_new_message(account: Account, message):
         account.send_message(
             chat_id,
             "✅ Логин найден!\n\n"
-            f"Вы указали: *{login}*\n"
-            f"Сумма: *{state['amount']} {state['currency']}* (≈ *{state['usd_amount']:.2f} USD*)\n\n"
-            "Если всё верно — напишите `+`.\n"
+            f"Вы указали: {login}\n"
+            f"Сумма: {state['amount']} {state['currency']} (≈ {state['usd_amount']:.2f} USD)\n\n"
+            "Если всё верно — напишите +.\n"
             "Если нужно изменить логин — просто отправьте новый."
         )
         logger.info(Fore.GREEN + f"✅ Логин подтверждён существующий: {login}")
         return
 
-    if state["step"] == "confirm_login":
+    if state.get("step") == "confirm_login":
         if text == "+":
+            if state.get("paid"):
+                account.send_message(chat_id, "ℹ️ Заказ уже обрабатывается/выполнен. Повторное списание не требуется.")
+                return
+            state["paid"] = True
+            state["step"] = "paying"
+
             logger.info(Fore.BLUE + f"🧾 Запрос на создание заказа для {state['login']} на {state['usd_amount']:.2f} USD")
             r, custom_id = create_order(state["login"], state["usd_amount"])
 
@@ -640,7 +728,10 @@ def handle_new_message(account: Account, message):
                 else:
                     account.send_message(chat_id, "⚠️ Автоматический возврат отключён. Свяжитесь с админом для возврата.")
 
-                USER_STATES.pop(user_id, None)
+                if "_pop_state" in globals():
+                    _pop_state(state)
+                else:
+                    USER_STATES.pop(chat_id, None)
                 return
 
             logger.info(Fore.BLUE + f"💳 Запрос на оплату заказа custom_id={custom_id}")
@@ -651,17 +742,20 @@ def handle_new_message(account: Account, message):
                 account.send_message(
                     chat_id,
                     "🎉 Готово!\n\n"
-                    f"Мы пополнили баланс *{state['login']}* на *{state['amount']} {state['currency']}* "
-                    f"(≈ *{state['usd_amount']:.2f} USD*).\n\n"
+                    f"Мы пополнили баланс {state['login']} на {state['amount']} {state['currency']} "
+                    f"(≈ {state['usd_amount']:.2f} USD).\n\n"
                     "Проверьте зачисление в Steam.\n"
                     "Пожалуйста, подтвердите выполнение заказа и, если не сложно, оставьте отзыв — это очень помогает!\n"
                     f"Ссылка на ваш заказ: {link}"
                 )
-                logger.info(
-                    Fore.GREEN
-                    + f"✅ Успешное пополнение: {state['amount']} {state['currency']} для {state['login']}. "
-                        "Заказ закрывается покупателем — подтверждение в чате не требуется."
-                )
+                logger.info(Fore.GREEN + f"✅ Успешное пополнение: {state['amount']} {state['currency']} для {state['login']}.")
+
+                state["step"] = "finished"
+                if "_pop_state" in globals():
+                    _pop_state(state)
+                else:
+                    USER_STATES.pop(chat_id, None)
+                return
             else:
                 user_msg = _friendly_http_error(pay_res, "Не удалось оплатить заказ в сервисе пополнения.")
                 account.send_message(chat_id, f"❌ {user_msg}")
@@ -679,31 +773,34 @@ def handle_new_message(account: Account, message):
                 else:
                     account.send_message(chat_id, "⚠️ Автоматический возврат отключён. Свяжитесь с админом для возврата.")
 
-                USER_STATES.pop(user_id, None)
-
-        else:
-            new_login = text
-            if not check_login(new_login):
-                account.send_message(
-                    chat_id,
-                    f"⚠️ Логин *{new_login}* не найден. Попробуйте снова:"
-                )
-                logger.info(Fore.YELLOW + f"🚫 Новый логин не найден: {new_login}")
+                if "_pop_state" in globals():
+                    _pop_state(state)
+                else:
+                    USER_STATES.pop(chat_id, None)
                 return
-            state["login"] = new_login
-            account.send_message(
-                chat_id,
-                "✅ Новый логин найден!\n\n"
-                f"Вы указали: *{new_login}*\n"
-                f"Сумма: *{state['amount']} {state['currency']}* (≈ *{state['usd_amount']:.2f} USD*)\n\n"
-                "Если всё верно — напишите `+`.\n"
-                "Если нужно изменить логин — укажите другой."
-            )
-            logger.info(Fore.GREEN + f"♻️ Логин обновлён: {new_login}")
+            
+        new_login = text
+        if state.get("paid"):
+            account.send_message(chat_id, "ℹ️ Заказ уже в обработке/выполнен. Изменить логин поздно.")
+            return
 
+        if not check_login(new_login):
+            account.send_message(chat_id, f"⚠️ Логин {new_login} не найден. Попробуйте снова:")
+            logger.info(Fore.YELLOW + f"🚫 Новый логин не найден: {new_login}")
+            return
+
+        state["login"] = new_login
+        account.send_message(
+            chat_id,
+            "✅ Новый логин найден!\n\n"
+            f"Вы указали: {new_login}\n"
+            f"Сумма: {state['amount']} {state['currency']} (≈ {state['usd_amount']:.2f} USD)\n\n"
+            "Если всё верно — напишите +.\n"
+            "Если нужно изменить логин — укажите другой."
+        )
+        logger.info(Fore.GREEN + f"♻️ Логин обновлён: {new_login}")
         return
 
-# ==================== RUNNER LOOP ====================
 def get_subcategory_id_safe(order, account):
     subcat = getattr(order, "subcategory", None) or getattr(order, "sub_category", None)
     if subcat and hasattr(subcat, "id"):
@@ -717,6 +814,11 @@ def get_subcategory_id_safe(order, account):
         logger.warning(Fore.YELLOW + f"⚠️ Не удалось загрузить полный заказ: {e}")
     return None, None
 
+def _banner():
+    logger.info(Style.BRIGHT + Fore.WHITE + "🚀 SteamBot запущен. Ожидаю события...")
+    logger.info(Style.BRIGHT + Fore.MAGENTA + f"ℹ️ {BANNER_NOTE}")
+    logger.info(Style.NORMAL + Fore.MAGENTA + f"   Автор: {CREATOR_NAME} | TG: {CREATOR_URL} | Канал: {CHANNEL_URL} | GitHub: {GITHUB_URL}\n")
+
 def main():
     if not FUNPAY_AUTH_TOKEN:
         raise RuntimeError("FUNPAY_AUTH_TOKEN не найден в .env")
@@ -729,9 +831,13 @@ def main():
     account.get()
     logger.info(Fore.GREEN + f"🔐 Авторизован как {getattr(account, 'username', '(unknown)')}")
 
-    runner = Runner(account)
-    logger.info(Style.BRIGHT + Fore.WHITE + "🚀 SteamBot запущен. Ожидаю события...")
+    global MY_ID
+    MY_ID = getattr(account, "id", None) or getattr(account, "user_id", None)
 
+    start_token_refresher()
+    _banner()
+
+    runner = Runner(account)
     for event in runner.listen(requests_delay=3.0):
         try:
             if isinstance(event, NewOrderEvent):
